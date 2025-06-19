@@ -1,7 +1,7 @@
-import os, json, time
+import os, json, time, random
 import pandas as pd
 from datetime import datetime, timedelta, UTC
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, ROUND_DOWN
 from binance.client import Client
 from binance import ThreadedWebsocketManager
 import keyring
@@ -14,8 +14,10 @@ SYMBOL     = "SPKUSDT"
 INTERVAL   = "15m"
 CANDLE_FILE = "ohlc_15m.jsonl"
 CANDLE_LIMIT_SEC = 8 * 60 * 60  # 48 hours
-ORDER_QUANTITY = Decimal("10")
-COOLDOWN_BARS = 4
+COOLDOWN_BARS = 3
+N_COMBOS = 10000
+FINE_TUNE = 2000
+USDT_PCT = Decimal("0.9")
 getcontext().prec = 12
 
 client = Client(API_KEY, API_SECRET)
@@ -67,18 +69,51 @@ def get_lot_size(symbol):
             return Decimal(f["stepSize"])
     return Decimal("0.00000001")
 
+def get_min_notional(symbol):
+    info = client.get_symbol_info(symbol)
+    for f in info["filters"]:
+        if f["filterType"] == "MIN_NOTIONAL":
+            return Decimal(f["minNotional"])
+    return Decimal("0")
+
 def round_down(val, step):
     return (val // step) * step
 
+def get_base_qty_to_buy(price, symbol, usdt_pct=Decimal("0.9")):
+    try:
+        free = Decimal(client.get_asset_balance("USDT")["free"])
+    except Exception as e:
+        log(f"BALANCE ERROR: {e}")
+        return Decimal("0")
+    spend = (free * usdt_pct).quantize(Decimal("0.00000001"))
+    step = get_lot_size(symbol)
+    qty = (spend / price).quantize(step, rounding=ROUND_DOWN)
+    min_notional = get_min_notional(symbol)
+    if (qty * price) < min_notional or qty <= 0:
+        return Decimal("0")
+    return qty
+
+def get_full_base_qty(symbol):
+    base = symbol.replace("USDT", "")
+    try:
+        qty = Decimal(client.get_asset_balance(base)["free"])
+        step = get_lot_size(symbol)
+        qty = qty.quantize(step, rounding=ROUND_DOWN)
+        min_notional = get_min_notional(symbol)
+        price = Decimal(client.get_symbol_ticker(symbol=symbol)["price"])
+        if (qty * price) < min_notional or qty <= 0:
+            return Decimal("0")
+        return qty
+    except Exception as e:
+        log(f"BASE BAL ERROR: {e}")
+        return Decimal("0")
+
 def compute_stoch(df, k_period):
-    # Ensure columns are objects so pandas doesn't cast them to float
     df['c'] = df['c'].astype(object)
     df['h'] = df['h'].astype(object)
     df['l'] = df['l'].astype(object)
-
     lows = df['l'].rolling(k_period).min()
     highs = df['h'].rolling(k_period).max()
-
     k_vals = []
     for i in range(len(df)):
         if i < k_period - 1:
@@ -128,12 +163,9 @@ def place_market_order(symbol, side, quantity):
         log(f"ORDER ERROR: {e}")
         return False
 
-import random
-
-def backtest_params(df, n_combos=10000, fine_tune=2000):
+def backtest_params(df, n_combos=N_COMBOS, fine_tune=FINE_TUNE):
     best_score = -999
     best_params = None
-
     # --- Random coarse search ---
     for _ in range(n_combos):
         k_period = random.randint(8, 20)
@@ -215,7 +247,6 @@ def backtest_params(df, n_combos=10000, fine_tune=2000):
         log(f"[Fine Tune] Best fine-tuned params: {best_params} ({best_score:.2f}%)")
     return best_params, best_score
 
-
 def get_trading_params():
     candles = load_recent_candles()
     df = pd.DataFrame(candles)
@@ -228,48 +259,36 @@ def get_trading_params():
     return params
 
 def process_candle(candle, state, is_closed):
-    # On close, store the candle in the file
     if is_closed:
         append_candle(candle)
-    # On close, prune (optional: keep up to 48h in file)
-    # On *every* update, recalc (with latest forming candle appended if not closed)
     candles = load_recent_candles()
     if not is_closed:
-        # Use the live candle (not yet closed) for current calculation
         candles.append(candle)
     df = pd.DataFrame(candles)
     for col in ["o","h","l","c","v"]:
         df[col] = df[col].astype(str).map(safe_dec)
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     df.set_index('ts', inplace=True)
-
-    # No signal if not enough candles
     if len(df) < state['params']['K_PERIOD'] + 2:
         return state, state.get('cooldown', 0)
-
     df = compute_stoch(df, state['params']['K_PERIOD'])
     if len(df) < 2:
         return state, state.get('cooldown', 0)
     signal = check_signals(df, state['params'])
     price = df['c'].iloc[-1]
-    step = get_lot_size(SYMBOL)
-    qty = round_down(ORDER_QUANTITY / price, step)
-    # For cooldown management per *candle* not per tick
     curr_ts = int(df.index[-1].timestamp())
-
-    # State defaults
     if "last_action_ts" not in state:
         state["last_action_ts"] = 0
     if "cooldown" not in state:
         state["cooldown"] = 0
-
-    # Decrement cooldown
     if state['cooldown'] > 0:
         state['cooldown'] -= 1
         return state, state['cooldown']
-
-    # Only act once per candle, per side
     if not state['in_position'] and signal["buy"] and curr_ts != state["last_action_ts"]:
+        qty = get_base_qty_to_buy(price, SYMBOL, USDT_PCT)
+        if qty <= 0:
+            log("Not enough USDT to trade.")
+            return state, state['cooldown']
         trade_ok = place_market_order(SYMBOL, Client.SIDE_BUY, qty)
         if trade_ok:
             log(f"BUY: {qty} {SYMBOL} @ {price} ({signal['reason']}) [intra-candle]")
@@ -277,18 +296,18 @@ def process_candle(candle, state, is_closed):
             state['cooldown'] = COOLDOWN_BARS
             state["last_action_ts"] = curr_ts
     elif state['in_position'] and signal["sell"] and curr_ts != state["last_action_ts"]:
+        qty = get_full_base_qty(SYMBOL)
+        if qty <= 0:
+            log("No base asset to sell.")
+            return state, state['cooldown']
         trade_ok = place_market_order(SYMBOL, Client.SIDE_SELL, qty)
         if trade_ok:
             log(f"SELL: {qty} {SYMBOL} @ {price} ({signal['reason']}) [intra-candle]")
             state['in_position'] = False
             state['cooldown'] = COOLDOWN_BARS
             state["last_action_ts"] = curr_ts
-            # Only re-optimize after sell
             state['params'] = get_trading_params()
             log(f"Parameters updated after sell.")
-    else:
-        # If you want, log live state here
-        pass
     return state, state['cooldown']
 
 def kline_callback(msg):
