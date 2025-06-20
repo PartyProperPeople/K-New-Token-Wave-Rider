@@ -10,14 +10,15 @@ import keyring
 KEYRING_SERVICE = "ema-grid-bot"
 API_KEY    = keyring.get_password(KEYRING_SERVICE, "API_KEY")
 API_SECRET = keyring.get_password(KEYRING_SERVICE, "API_SECRET")
-SYMBOL     = "SPKUSDT"
-INTERVAL   = "15m"
-CANDLE_FILE = "ohlc_15m.jsonl"
-CANDLE_LIMIT_SEC = 8 * 60 * 60  # 48 hours
-COOLDOWN_BARS = 3
-N_COMBOS = 10000
+SYMBOL     = "PEPEUSDT"
+INTERVAL   = "5m"
+CANDLE_FILE = "ohlc_5m.jsonl"
+CANDLE_LIMIT_SEC = 4 * 60 * 60  # 48 hours
+COOLDOWN_BARS = 4
+N_COMBOS = 100000
 FINE_TUNE = 2000
 USDT_PCT = Decimal("0.9")
+MIN_USDT_BAL = Decimal("5")
 getcontext().prec = 12
 
 client = Client(API_KEY, API_SECRET)
@@ -62,12 +63,18 @@ def fill_history_if_needed():
             }
             f.write(json.dumps(candle) + "\n")
 
-def get_lot_size(symbol):
+def get_lot_size_info(symbol):
     info = client.get_symbol_info(symbol)
+    lot_size = {}
     for f in info["filters"]:
         if f["filterType"] == "LOT_SIZE":
-            return Decimal(f["stepSize"])
-    return Decimal("0.00000001")
+            lot_size = {
+                "stepSize": Decimal(f["stepSize"]),
+                "minQty": Decimal(f["minQty"]),
+                "maxQty": Decimal(f["maxQty"]),
+                "decimals": abs(Decimal(f["stepSize"]).normalize().as_tuple().exponent)
+            }
+    return lot_size
 
 def get_min_notional(symbol):
     info = client.get_symbol_info(symbol)
@@ -76,8 +83,15 @@ def get_min_notional(symbol):
             return Decimal(f["minNotional"])
     return Decimal("0")
 
-def round_down(val, step):
-    return (val // step) * step
+def adjust_qty(qty, symbol):
+    lot = get_lot_size_info(symbol)
+    step = lot["stepSize"]
+    qty = (qty // step) * step
+    decimals = lot["decimals"]
+    qty = qty.quantize(Decimal('1e-{0}'.format(decimals)), rounding=ROUND_DOWN)
+    if qty < lot["minQty"]:
+        return Decimal("0")
+    return qty
 
 def get_base_qty_to_buy(price, symbol, usdt_pct=Decimal("0.9")):
     try:
@@ -86,8 +100,8 @@ def get_base_qty_to_buy(price, symbol, usdt_pct=Decimal("0.9")):
         log(f"BALANCE ERROR: {e}")
         return Decimal("0")
     spend = (free * usdt_pct).quantize(Decimal("0.00000001"))
-    step = get_lot_size(symbol)
-    qty = (spend / price).quantize(step, rounding=ROUND_DOWN)
+    qty = spend / price
+    qty = adjust_qty(qty, symbol)
     min_notional = get_min_notional(symbol)
     if (qty * price) < min_notional or qty <= 0:
         return Decimal("0")
@@ -97,8 +111,7 @@ def get_full_base_qty(symbol):
     base = symbol.replace("USDT", "")
     try:
         qty = Decimal(client.get_asset_balance(base)["free"])
-        step = get_lot_size(symbol)
-        qty = qty.quantize(step, rounding=ROUND_DOWN)
+        qty = adjust_qty(qty, symbol)
         min_notional = get_min_notional(symbol)
         price = Decimal(client.get_symbol_ticker(symbol=symbol)["price"])
         if (qty * price) < min_notional or qty <= 0:
@@ -131,22 +144,39 @@ def compute_stoch(df, k_period):
     df = df.dropna()
     return df
 
-def check_signals(df, params):
-    lower, mid, upper = params['LOWER'], params['MID'], params['UPPER']
+def check_signals(df, params, usdt_balance):
+    bounds = [
+        params['LOWER'],
+        params['MID_LOWER'],
+        params['MID'],
+        params['MID_UPPER'],
+        params['UPPER'],
+    ]
+    names = ['LOWER', 'MID_LOWER', 'MID', 'MID_UPPER', 'UPPER']
     k_prev, k_now = df["K"].iloc[-2], df["K"].iloc[-1]
-    signals = {"buy": False, "sell": False, "reason": None}
-    if k_prev < lower and k_now > lower:
+    signals = {"buy": False, "buy_level": None, "sell": False, "sell_level": None, "reason": None}
+    # BUY: Cross up of LOWER or MID_LOWER (if enough USDT)
+    if k_prev < bounds[0] and k_now > bounds[0] and usdt_balance > MIN_USDT_BAL:
         signals["buy"] = True
-        signals["reason"] = "K crosses up LOWER"
-    elif k_prev < upper and k_now > upper:
+        signals["buy_level"] = names[0]
+        signals["reason"] = f"K crosses up {names[0]}"
+    elif k_prev < bounds[1] and k_now > bounds[1] and usdt_balance > MIN_USDT_BAL:
+        signals["buy"] = True
+        signals["buy_level"] = names[1]
+        signals["reason"] = f"K crosses up {names[1]}"
+    # SELL: Cross up of UPPER
+    elif k_prev < bounds[4] and k_now > bounds[4]:
         signals["sell"] = True
-        signals["reason"] = "K crosses up UPPER"
-    elif k_prev > mid and k_now < mid:
-        signals["sell"] = True
-        signals["reason"] = "K crosses down MID"
-    elif k_prev > lower and k_now < lower:
-        signals["sell"] = True
-        signals["reason"] = "K crosses down LOWER"
+        signals["sell_level"] = names[4]
+        signals["reason"] = f"K crosses up {names[4]}"
+    # SELL: Cross down of ANY bound
+    else:
+        for idx, b in enumerate(bounds):
+            if k_prev > b and k_now < b:
+                signals["sell"] = True
+                signals["sell_level"] = names[idx]
+                signals["reason"] = f"K crosses down {names[idx]}"
+                break
     return signals
 
 def place_market_order(symbol, side, quantity):
@@ -166,33 +196,40 @@ def place_market_order(symbol, side, quantity):
 def backtest_params(df, n_combos=N_COMBOS, fine_tune=FINE_TUNE):
     best_score = -999
     best_params = None
-    # --- Random coarse search ---
     for _ in range(n_combos):
         k_period = random.randint(8, 20)
-        lower = random.randint(10, 30)
-        upper = random.randint(70, 90)
-        if upper <= lower + 10:
+        lower = random.randint(5, 20)
+        mid_lower = random.randint(lower+1, lower+15)
+        mid = random.randint(mid_lower+1, mid_lower+15)
+        mid_upper = random.randint(mid+1, mid+15)
+        upper = random.randint(mid_upper+1, 90)
+        if not (lower < mid_lower < mid < mid_upper < upper):
             continue
-        mid = random.randint(lower + 2, upper - 2)
         df_stoch = compute_stoch(df, k_period)
         if len(df_stoch) < 3:
             continue
         trades = []
         in_position = False
         last_entry = -COOLDOWN_BARS
+        usdt_balance = Decimal("100")  # Simulated for backtest
         for i in range(1, len(df_stoch)):
             k_prev = df_stoch["K"].iloc[i-1]
             k_now = df_stoch["K"].iloc[i]
-            if not in_position and (k_prev < lower and k_now > lower) and (i - last_entry >= COOLDOWN_BARS):
+            signals = {"buy": False, "sell": False}
+            if k_prev < lower and k_now > lower:
+                signals["buy"] = True
+            elif k_prev < mid_lower and k_now > mid_lower:
+                signals["buy"] = True
+            elif k_prev < upper and k_now > upper:
+                signals["sell"] = True
+            elif (k_prev > lower and k_now < lower) or (k_prev > mid_lower and k_now < mid_lower) or (k_prev > mid and k_now < mid) or (k_prev > mid_upper and k_now < mid_upper) or (k_prev > upper and k_now < upper):
+                signals["sell"] = True
+            if not in_position and signals["buy"] and (i - last_entry >= COOLDOWN_BARS):
                 entry = df_stoch['c'].iloc[i]
                 trades.append({'entry': entry, 'entry_idx': i})
                 in_position = True
                 last_entry = i
-            elif in_position and (
-                (k_prev < upper and k_now > upper) or
-                (k_prev > mid and k_now < mid) or
-                (k_prev > lower and k_now < lower)
-            ):
+            elif in_position and signals["sell"]:
                 trades[-1]['exit'] = df_stoch['c'].iloc[i]
                 in_position = False
         total = Decimal("1")
@@ -203,36 +240,58 @@ def backtest_params(df, n_combos=N_COMBOS, fine_tune=FINE_TUNE):
         pct = (total - Decimal("1")) * 100
         if pct > best_score:
             best_score = pct
-            best_params = {'K_PERIOD': k_period, 'LOWER': Decimal(lower), 'MID': Decimal(mid), 'UPPER': Decimal(upper)}
+            best_params = {
+                'K_PERIOD': k_period,
+                'LOWER': Decimal(lower),
+                'MID_LOWER': Decimal(mid_lower),
+                'MID': Decimal(mid),
+                'MID_UPPER': Decimal(mid_upper),
+                'UPPER': Decimal(upper)
+            }
     log(f"[Random Search] Best coarse params: {best_params} ({best_score:.2f}%)")
-
-    # --- Fine-tune around best ---
     if best_params:
-        best_k, best_l, best_m, best_u = int(best_params['K_PERIOD']), int(best_params['LOWER']), int(best_params['MID']), int(best_params['UPPER'])
+        best_k = int(best_params['K_PERIOD'])
+        best_b = [
+            int(best_params['LOWER']),
+            int(best_params['MID_LOWER']),
+            int(best_params['MID']),
+            int(best_params['MID_UPPER']),
+            int(best_params['UPPER'])
+        ]
         for _ in range(fine_tune):
             k_period = max(5, min(30, best_k + random.randint(-2, 2)))
-            lower = max(5, min(45, best_l + random.randint(-2, 2)))
-            upper = max(lower + 10, min(95, best_u + random.randint(-2, 2)))
-            mid = max(lower + 1, min(upper - 1, best_m + random.randint(-2, 2)))
+            lower = max(1, best_b[0] + random.randint(-2, 2))
+            mid_lower = max(lower+1, best_b[1] + random.randint(-2, 2))
+            mid = max(mid_lower+1, best_b[2] + random.randint(-2, 2))
+            mid_upper = max(mid+1, best_b[3] + random.randint(-2, 2))
+            upper = max(mid_upper+1, best_b[4] + random.randint(-2, 2))
+            if not (lower < mid_lower < mid < mid_upper < upper):
+                continue
             df_stoch = compute_stoch(df, k_period)
             if len(df_stoch) < 3:
                 continue
             trades = []
             in_position = False
             last_entry = -COOLDOWN_BARS
+            usdt_balance = Decimal("100")
             for i in range(1, len(df_stoch)):
                 k_prev = df_stoch["K"].iloc[i-1]
                 k_now = df_stoch["K"].iloc[i]
-                if not in_position and (k_prev < lower and k_now > lower) and (i - last_entry >= COOLDOWN_BARS):
+                signals = {"buy": False, "sell": False}
+                if k_prev < lower and k_now > lower:
+                    signals["buy"] = True
+                elif k_prev < mid_lower and k_now > mid_lower:
+                    signals["buy"] = True
+                elif k_prev < upper and k_now > upper:
+                    signals["sell"] = True
+                elif (k_prev > lower and k_now < lower) or (k_prev > mid_lower and k_now < mid_lower) or (k_prev > mid and k_now < mid) or (k_prev > mid_upper and k_now < mid_upper) or (k_prev > upper and k_now < upper):
+                    signals["sell"] = True
+                if not in_position and signals["buy"] and (i - last_entry >= COOLDOWN_BARS):
                     entry = df_stoch['c'].iloc[i]
                     trades.append({'entry': entry, 'entry_idx': i})
                     in_position = True
                     last_entry = i
-                elif in_position and (
-                    (k_prev < upper and k_now > upper) or
-                    (k_prev > mid and k_now < mid) or
-                    (k_prev > lower and k_now < lower)
-                ):
+                elif in_position and signals["sell"]:
                     trades[-1]['exit'] = df_stoch['c'].iloc[i]
                     in_position = False
             total = Decimal("1")
@@ -243,7 +302,14 @@ def backtest_params(df, n_combos=N_COMBOS, fine_tune=FINE_TUNE):
             pct = (total - Decimal("1")) * 100
             if pct > best_score:
                 best_score = pct
-                best_params = {'K_PERIOD': k_period, 'LOWER': Decimal(lower), 'MID': Decimal(mid), 'UPPER': Decimal(upper)}
+                best_params = {
+                    'K_PERIOD': k_period,
+                    'LOWER': Decimal(lower),
+                    'MID_LOWER': Decimal(mid_lower),
+                    'MID': Decimal(mid),
+                    'MID_UPPER': Decimal(mid_upper),
+                    'UPPER': Decimal(upper)
+                }
         log(f"[Fine Tune] Best fine-tuned params: {best_params} ({best_score:.2f}%)")
     return best_params, best_score
 
@@ -274,7 +340,12 @@ def process_candle(candle, state, is_closed):
     df = compute_stoch(df, state['params']['K_PERIOD'])
     if len(df) < 2:
         return state, state.get('cooldown', 0)
-    signal = check_signals(df, state['params'])
+    try:
+        usdt_balance = Decimal(client.get_asset_balance("USDT")["free"])
+    except Exception as e:
+        log(f"BALANCE ERROR: {e}")
+        usdt_balance = Decimal("0")
+    signal = check_signals(df, state['params'], usdt_balance)
     price = df['c'].iloc[-1]
     curr_ts = int(df.index[-1].timestamp())
     if "last_action_ts" not in state:
@@ -287,7 +358,7 @@ def process_candle(candle, state, is_closed):
     if not state['in_position'] and signal["buy"] and curr_ts != state["last_action_ts"]:
         qty = get_base_qty_to_buy(price, SYMBOL, USDT_PCT)
         if qty <= 0:
-            log("Not enough USDT to trade.")
+            log("Not enough USDT to trade or qty below minQty.")
             return state, state['cooldown']
         trade_ok = place_market_order(SYMBOL, Client.SIDE_BUY, qty)
         if trade_ok:
@@ -298,7 +369,7 @@ def process_candle(candle, state, is_closed):
     elif state['in_position'] and signal["sell"] and curr_ts != state["last_action_ts"]:
         qty = get_full_base_qty(SYMBOL)
         if qty <= 0:
-            log("No base asset to sell.")
+            log("No base asset to sell or qty below minQty.")
             return state, state['cooldown']
         trade_ok = place_market_order(SYMBOL, Client.SIDE_SELL, qty)
         if trade_ok:
